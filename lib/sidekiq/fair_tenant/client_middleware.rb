@@ -31,15 +31,24 @@ module Sidekiq
       def enabled?(job_class, job, queue)
         return false if job["fair_tenant_queues"].blank? # Not configured for throttling
 
-        original_queue = original_queue(job_class, job, queue)
-        return false if original_queue != job["queue"] # Someone already rerouted this job, nothing to do here
+        if job["slotted_queues"].blank?
+          original_queue = original_queue(job_class, job, queue)
+          return false if original_queue != job["queue"] # Someone already rerouted this job, nothing to do here
+        else
+          return false unless job["slotted_queues"].map(&:to_s).include?(job["queue"].to_s) # Someone already rerouted this job, nothing to do here
+        end
 
         true
+      end
+
+      def slotted?(job)
+        job["slotted_queues"].present? # Configured for slotting
       end
 
       # Writes job to sliding window sorted set
       def register_job(job_class, job, queue, redis)
         enqueues_key = enqueues_key(job_class, job, queue)
+
         max_throttling_window = Sidekiq::FairTenant.max_throttling_window
         redis.multi do |tx|
           tx.zremrangebyscore(enqueues_key, "-inf", (Time.now - max_throttling_window).to_i)
@@ -52,9 +61,12 @@ module Sidekiq
       # Assumes the slowest queue, with most restrictive rule, comes last in the `fair_tenants` array.
       def assign_queue(job_class, job, queue, redis)
         enqueues_key = enqueues_key(job_class, job, queue)
+        slotted = slotted?(job)
 
         matching_rules =
           job["fair_tenant_queues"].map(&:symbolize_keys).filter do |config|
+            next if slotted && !config[:slots].map(&:to_s).include?(queue)
+
             threshold = config[:threshold]
             window_start = Time.now - (config[:per] || Sidekiq::FairTenant.max_throttling_window)
             threshold < redis.zcount(enqueues_key, window_start.to_i, Time.now.to_i)
